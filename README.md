@@ -8,6 +8,16 @@
 
 ## DeepSeek-V2-Lite 结构速览
 
+### 官方架构图
+
+![DeepSeek-V2 architecture](https://raw.githubusercontent.com/deepseek-ai/DeepSeek-V2/main/figures/architecture.png)
+
+<sub>图源：[deepseek-ai/DeepSeek-V2](https://github.com/deepseek-ai/DeepSeek-V2)（MIT），论文 [arXiv:2405.04434](https://arxiv.org/abs/2405.04434)。
+图中带斜线的圆圈是推理时缓存的内容：latent c<sup>KV</sup> 和 k<sup>R</sup>。
+注意：图里 Q 也先压缩到 latent c<sup>Q</sup>，那是完整版 V2 的做法；**V2-Lite 没有这一步**（`q_lora_rank=None`），直接 `q_proj` 出 q。</sub>
+
+### 关键参数
+
 | 项目 | 数值 |
 |---|---|
 | 总参数 / 激活参数 | 15.7B / 2.4B |
@@ -18,23 +28,138 @@
 | RoPE | YaRN，factor 40，注意力 scale = mscale² / √192 ≈ 0.1147 |
 | KV cache | 每 token 每层 576 维（512 latent + 64 k_pe），bf16 下每 token 共 30.4 KB |
 
-MLA 一层的数据流：
+### 整体结构
 
-```
-q = q_proj(h) -> [N,16,192] -> split(q_nope 128, q_pe 64)
-kv_a_proj_with_mqa(h) -> split(latent 512, k_pe 64);  latent = RMSNorm(latent)
-RoPE(q_pe, k_pe)                               # 交错排列，k_pe 所有头共享
-cache <- (latent, k_pe)                        # 只存 576 维
-prefill: kv_b_proj(latent) -> k_nope, v；标准因果注意力
-decode : q 投影到 latent 空间，直接在压缩 cache 上做注意力，最后乘 W_v
-out = o_proj(...)
+```mermaid
+flowchart LR
+    ids["input_ids [N]"] --> emb["embed_tokens<br/>102400 × 2048"]
+    emb --> L0["第 0 层<br/>MLA + dense FFN<br/>2048 → 10944 → 2048"]
+    L0 --> L1["第 1–26 层（×26）<br/>MLA + DeepSeekMoE<br/>64 选 6 + 2 共享"]
+    L1 --> fn["RMSNorm"] --> head["lm_head<br/>2048 → 102400"] --> logits["logits"]
 ```
 
-decode 用到的恒等式（`tests/test_ops.py::test_latent_decode_equals_decompressed_attention` 验证）：
+每一层都是 pre-norm 残差结构：
+
+```mermaid
+flowchart LR
+    x["hidden [N, 2048]"] --> n1["RMSNorm"] --> attn["MLA"] --> add1(("+"))
+    x --> add1
+    add1 --> n2["RMSNorm"] --> ffn["FFN 或 MoE"] --> add2(("+"))
+    add1 --> add2
+    add2 --> y["下一层"]
+```
+
+代码里把「+ 残差」和下一个 RMSNorm 合并成一个算子 `fused_add_rms_norm`，少读写一遍内存。
+
+### MLA（一层注意力）
+
+图中**加粗**的是本项目的 C++ 算子。
+
+**① 投影、RoPE、写 cache**：prefill 和 decode 都一样
+
+```mermaid
+flowchart TB
+    h["h [N, 2048]"]
+    h --> qproj["q_proj<br/>2048 → 16 × 192"]
+    h --> kva["kv_a_proj_with_mqa<br/>2048 → 576"]
+    qproj --> qnope["q_nope [N, 16, 128]<br/>不带位置"]
+    qproj --> qpe["q_pe [N, 16, 64]"]
+    kva --> lat["latent [N, 512]"]
+    kva --> kpe["k_pe [N, 1, 64]<br/>所有头共享一份"]
+    lat --> kvnorm["kv_a_layernorm<br/><b>rms_norm</b>"]
+    qpe --> rope["<b>rotary_embedding</b><br/>YaRN，交错排列"]
+    kpe --> rope
+    kvnorm --> cache[("<b>concat_and_cache_mla</b><br/>KV cache 每行 576 维<br/>= latent 512 + k_pe 64")]
+    rope -- "k_pe" --> cache
+    rope -- "q_pe" --> qout["q_pe（已旋转）"]
+```
+
+**② 注意力**：prefill 和 decode 走不同路径
+
+```mermaid
+flowchart LR
+    subgraph prefill["prefill：解压后做标准注意力"]
+        direction TB
+        p_lat["latent [N, 512]"] --> kvb["kv_b_proj 512 → 16 × 256"]
+        kvb --> p_split["k_nope [N,16,128]<br/>v [N,16,128]"]
+        p_q["q_nope + q_pe"] --> p_cat["q, k 都是 192 维<br/>k_pe 复制到 16 个头"]
+        p_split --> p_cat
+        p_cat --> pattn["<b>mla_prefill_attention</b><br/>因果，scale ≈ 0.1147<br/>输出 [N,16,128]"]
+    end
+    subgraph decode["decode：不解压 cache"]
+        direction TB
+        d_q["q_nope [B,16,128]"] --> qlat["× W_kᵀ → [B,16,512]<br/>拼上 q_pe → [B,16,576]"]
+        d_cache[("KV cache<br/>[blocks, 16, 576]")] --> dattn
+        qlat --> dattn["<b>mla_decode_attention</b><br/>和 cache 行直接点积<br/>输出 latent 加权和 [B,16,512]"]
+        dattn --> wv["× W_v → [B,16,128]"]
+    end
+    pattn --> oproj["o_proj<br/>16 × 128 → 2048"]
+    wv --> oproj
+```
+
+decode 为什么可以不解压？`kv_b_proj` 的权重按行切成 W_k（前 128 行）和 W_v（后 128 行），利用两条恒等式
+（`tests/test_ops.py::test_latent_decode_equals_decompressed_attention` 验证）：
 
 ```
-q_nope · (W_k c) = (W_kᵀ q_nope) · c          # 注意力分数不用解压 cache
-Σ aₜ (W_v cₜ)    = W_v (Σ aₜ cₜ)               # value 在 latent 空间累加
+q_nope · (W_k c) = (W_kᵀ q_nope) · c          # 注意力分数：query 投影到 latent 空间，直接和 cache 点积
+Σ aₜ (W_v cₜ)    = W_v (Σ aₜ cₜ)               # value：先在 latent 空间加权求和，最后乘一次 W_v
+```
+
+### KV cache 有多省
+
+按 V2-Lite 的头维度（K 192、V 128），每个 token 每层需要缓存的元素数：
+
+| 方案 | 每 token 每层 | 相对 MHA |
+|---|---:|---|
+| MHA（16 头 × (192 + 128)） | 5120 | `████████████████████` 100% |
+| GQA 4 组（假设同样头维度） | 1280 | `█████` 25% |
+| **MLA（V2-Lite 实际）** | **576** | `██▎` 11.3% |
+| MQA 1 组（假设同样头维度） | 320 | `█▎` 6.3% |
+
+MLA 缓存量接近 MQA，但每个头仍然有自己的 k_nope 和 v（从 latent 解压得到），表达能力接近 MHA。
+
+### 分页 KV cache 的组织
+
+```
+kv_cache[layer] : [num_blocks, block_size=16, 576]
+                                               └─ 每行 = [ latent 512 | k_pe 64 ]
+
+seq A（37 个 token）block_table = [5, 2, 9]
+  block 5 : token  0–15
+  block 2 : token 16–31
+  block 9 : token 32–36（剩 11 个空位留给后续 decode）
+
+slot = block_id × 16 + offset      # concat_and_cache_mla 按 slot 写入
+                                   # mla_decode_attention 按 block_table 读出
+```
+
+### DeepSeekMoE（一层 FFN）
+
+```mermaid
+flowchart LR
+    x["x [N, 2048]"] --> gate["gate：Linear 2048 → 64<br/>float32"]
+    gate --> topk["<b>topk_softmax</b><br/>softmax 后取 top-6<br/>weights [N,6]，ids [N,6]"]
+    topk -- "ids" --> align["<b>moe_align</b><br/>按专家计数排序<br/>sorted_idx [6N]，offsets [65]"]
+    x --> gather["index_select<br/>按专家排好的 token [6N, 2048]"]
+    align --> gather
+    gather --> expert["<b>moe_expert_forward</b><br/>每个专家一个 SwiGLU<br/>2048 → 1408 → 2048"]
+    expert --> combine["<b>moe_combine</b><br/>乘路由权重，加回 token 顺序<br/>[N, 2048]"]
+    topk -- "weights" --> combine
+    align -- "sorted_idx" --> combine
+    x --> shared["shared_experts<br/>2 个合成 1 个 SwiGLU<br/>2048 → 2816 → 2048"]
+    combine --> add(("+"))
+    shared --> add
+    add --> out["out [N, 2048]"]
+```
+
+`moe_align` 的作用：把 N 个 token × 6 个选择按专家编号排好，每个专家的 token 挨在一起，
+这样 `moe_expert_forward` 每个专家只做一次矩阵乘，而不是逐 token 计算。例如 N=3、top-2、4 个专家：
+
+```
+topk_ids  = [[2, 0],   [1, 2],   [0, 3]]       # 扁平下标 0..5
+sorted_idx = [1, 4,  2,  0, 3,  5]              # 专家 0: 扁平位置 1,4；专家 1: 2；专家 2: 0,3；专家 3: 5
+offsets    = [0, 2, 3, 5, 6]
+token 号   = sorted_idx // 2 = [0, 2, 1, 0, 1, 2]
 ```
 
 ## 算子列表
