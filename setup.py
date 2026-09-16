@@ -32,7 +32,18 @@ if use_cuda:
     ext = CUDAExtension(
         "llm_infer._C",
         sources + cuda_sources,
-        extra_compile_args={"cxx": cxx_flags, "nvcc": ["-O3", "-std=c++20"]},
+        extra_compile_args={
+            "cxx": cxx_flags,
+            # torch 默认定义了 __CUDA_NO_HALF_* 等宏，这里取消掉，让 c10::Half / BFloat16 能在内核里正常转换
+            "nvcc": [
+                "-O3",
+                "-std=c++20",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+            ],
+        },
     )
 else:
     ext = CppExtension("llm_infer._C", sources, extra_compile_args={"cxx": cxx_flags})

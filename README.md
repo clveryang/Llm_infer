@@ -166,22 +166,26 @@ token 号   = sorted_idx // 2 = [0, 2, 1, 0, 1, 2]
 
 | 算子 | 用途 | CPU C++ | CUDA |
 |---|---|:-:|:-:|
-| `rms_norm` | 各处 RMSNorm | ✅ | ⬜ |
-| `fused_add_rms_norm` | 残差相加 + RMSNorm 融合 | ✅ | ⬜ |
-| `silu_and_mul` | SwiGLU 激活 | ✅ | ⬜ |
-| `rotary_embedding` | YaRN RoPE（交错 / neox 两种排列） | ✅ | ⬜ |
-| `concat_and_cache_mla` | 写分页 latent KV cache | ✅ | ⬜ |
-| `mla_prefill_attention` | 变长因果注意力，QK/V 维度不同 | ✅ | ⬜ |
-| `mla_decode_attention` | 在压缩 cache 上的分页 decode 注意力 | ✅ | ⬜ |
-| `topk_softmax` | MoE 路由 | ✅ | ⬜ |
-| `moe_align` | 按专家计数排序 | ✅ | ⬜ |
-| `moe_expert_forward` | 分组 SwiGLU 专家计算 | ✅ | ⬜ |
-| `moe_combine` | 加权合并回 token 顺序 | ✅ | ⬜ |
+| `rms_norm` | 各处 RMSNorm | ✅ | 🟡 |
+| `fused_add_rms_norm` | 残差相加 + RMSNorm 融合 | ✅ | 🟡 |
+| `silu_and_mul` | SwiGLU 激活 | ✅ | 🟡 |
+| `rotary_embedding` | YaRN RoPE（交错 / neox 两种排列） | ✅ | 🟡 |
+| `concat_and_cache_mla` | 写分页 latent KV cache | ✅ | 🟡 |
+| `mla_prefill_attention` | 变长因果注意力，QK/V 维度不同 | ✅ | 🟡 |
+| `mla_decode_attention` | 在压缩 cache 上的分页 decode 注意力 | ✅ | 🟡 |
+| `topk_softmax` | MoE 路由 | ✅ | 🟡 |
+| `moe_align` | 按专家计数排序 | ✅ | 🟡 |
+| `moe_expert_forward` | 分组 SwiGLU 专家计算 | ✅ | 🟡 |
+| `moe_combine` | 加权合并回 token 顺序 | ✅ | 🟡 |
+
+✅ 已实现并通过测试　🟡 已实现，用 CUDA 12.8 nvcc 针对 sm_120（Blackwell）编译通过（Docker 内无 GPU，只做了编译检查），**还没在真实 GPU 上跑过测试**
 
 Embedding、Linear、lm_head 直接用 torch（BLAS / cuBLAS）。
-CUDA 列还没写：在 GPU 上目前所有算子自动回退到 `ref_ops`，模型可以直接跑，再一个个替换成 CUDA 内核。
 
-CPU 内核只支持 float32 / float64（CPU 上 bf16 没有原生算术类型），其他 dtype 自动回退。
+- CPU 内核支持 float32 / float64（CPU 上 bf16 没有原生算术类型，其他 dtype 自动回退到 `ref_ops`）。
+- CUDA 内核支持 float32 / float16 / bfloat16 / float64，半精度在内核里提升到 float32 计算再写回。
+- CUDA 版本是朴素实现，重在对照理解：注意力每个 (query, head) 一个 GPU 线程、两遍扫描完成 softmax（第一遍 double 累加 logsumexp，第二遍加权求和，不占额外显存）；
+  专家计算每个专家两次 cuBLAS 矩阵乘。性能优化方向见文末。
 
 ## 目录
 
@@ -192,7 +196,10 @@ csrc/
   cpu/norm_act.cpp       rms_norm / fused_add_rms_norm / silu_and_mul
   cpu/mla.cpp            rotary / cache 写入 / prefill & decode 注意力
   cpu/moe.cpp            topk_softmax / moe_align / expert_forward / combine
-  cuda/                  （待写）放 .cu 文件，setup.py 会自动编译
+  cuda/common.cuh        dtype 分发宏、launch 辅助、logsumexp
+  cuda/norm_act.cu       rms_norm / fused_add_rms_norm / silu_and_mul
+  cuda/mla.cu            rotary / cache 写入 / prefill & decode 注意力
+  cuda/moe.cu            topk_softmax / moe_align / expert_forward / combine
 llm_infer/
   ops.py                 分发层：C++ 内核 or 参考实现
   ref_ops.py             纯 PyTorch 参考实现
@@ -233,11 +240,20 @@ python examples/generate.py --model-dir checkpoints/DeepSeek-V2-Lite-Chat --prom
 
 Blackwell 注意：torch 需要支持 `sm_120`（CUDA ≥ 12.8、驱动 ≥ 570），编译扩展时设置 `TORCH_CUDA_ARCH_LIST=12.0`。
 
-## 下一步：写 CUDA 内核
+## 下一步：在 GPU 上验证和优化 CUDA 内核
 
-1. 在 `csrc/cuda/xxx.cu` 实现，末尾 `TORCH_LIBRARY_IMPL(llm_infer, CUDA, m) { m.impl("xxx", &xxx); }`
-2. `pip install -e . --no-build-isolation` 重新编译
-3. `pytest tests/test_ops.py -k xxx`：测试会自动加入 cuda 设备，和参考实现对比
-4. `python scripts/compare_hf.py` 确认整模型没问题，再比较吞吐
+```bash
+bash scripts/setup_vast.sh                    # 编译 + 全部测试 + 下载模型 + 和 transformers 对比
+pytest -q tests/test_ops.py -k cuda           # 只跑 CUDA 算子测试
+LLM_INFER_BACKEND=torch python examples/generate.py ...   # 对照：全部走 PyTorch 参考实现
+```
 
-建议顺序：`rms_norm` / `silu_and_mul`（入门）→ `rotary_embedding` / `concat_and_cache_mla` → `topk_softmax` / `moe_align` → `mla_decode_attention`（分页 + latent，重点）→ `mla_prefill_attention` → `moe_expert_forward`（grouped GEMM）。
+`tests/test_ops.py` 在有 GPU 时自动加入 cuda 设备：fp32/fp64 和参考实现逐元素对比，fp16/bf16 和「转 float32 后的参考实现」对比；
+`tests/test_model_vs_hf.py` 会把小模型放到 GPU 上和 transformers 对比 logits。
+
+性能优化方向（从收益大到小）：
+1. `mla_decode_attention`：按 block 分块、多个 key 并行算点积，参考 FlashMLA / FlashInfer 的 MLA decode kernel
+2. `moe_expert_forward`：grouped GEMM（`cublasGemmGroupedBatchedEx` 或 Triton），去掉逐专家循环和 offsets 的 CPU 同步
+3. `mla_prefill_attention`：分块 tiled attention（FlashAttention 思路），或直接调用 FlashAttention 做 V pad
+4. `moe_align`：并行版本（参考 vLLM `moe_align_block_size`）
+5. CUDA Graph 捕获 decode 步，去掉 Python / launch 开销

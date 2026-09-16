@@ -225,3 +225,86 @@ def test_moe_expert_forward_and_combine(device, dtype):
     torch.testing.assert_close(
         C.moe_combine(e1, sorted_idx, weights, N), ref_ops.moe_combine(e1, sorted_idx, weights, N), **tol(dtype)
     )
+
+
+# ---------------- CUDA 半精度 ----------------
+# CUDA 内核内部把 fp16/bf16 提升到 float32 计算，所以对照组是「同样输入转 float32 后跑参考实现」，
+# 差异只来自最后写回半精度时的舍入。
+HALF_TOL = {torch.float16: dict(rtol=5e-3, atol=5e-3), torch.bfloat16: dict(rtol=2e-2, atol=2e-2)}
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
+
+
+def _assert_half(got, expected_f32, dtype):
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.float(), expected_f32.float(), **HALF_TOL[dtype])
+
+
+@cuda_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_half_norm_act(dtype):
+    need_kernel("rms_norm", "cuda")
+    x = torch.randn(33, 128, device="cuda").to(dtype)
+    r = torch.randn(33, 128, device="cuda").to(dtype)
+    w = (torch.rand(128, device="cuda") + 0.5).to(dtype)
+    _assert_half(C.rms_norm(x, w, 1e-6), ref_ops.rms_norm(x.float(), w.float(), 1e-6), dtype)
+
+    x1, r1, x2, r2 = x.clone(), r.clone(), x.float(), r.float()
+    C.fused_add_rms_norm(x1, r1, w, 1e-6)
+    ref_ops.fused_add_rms_norm(x2, r2, w.float(), 1e-6)
+    _assert_half(x1, x2, dtype)
+    _assert_half(r1, r2, dtype)
+
+    g = torch.randn(9, 2 * 64, device="cuda").to(dtype)
+    _assert_half(C.silu_and_mul(g), ref_ops.silu_and_mul(g.float()), dtype)
+
+
+@cuda_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_half_mla(dtype):
+    need_kernel("mla_decode_attention", "cuda")
+    from llm_infer.rope import build_cos_sin_cache
+
+    cache = build_cos_sin_cache(64, 128, 10000.0, None, torch.float32, "cuda")
+    pos = torch.randint(0, 128, (11,), device="cuda")
+    q = torch.randn(11, 16, 64, device="cuda").to(dtype)
+    k = torch.randn(11, 1, 64, device="cuda").to(dtype)
+    q1, k1, q2, k2 = q.clone(), k.clone(), q.float(), k.float()
+    C.rotary_embedding(pos, q1, k1, cache.to(dtype), False)
+    ref_ops.rotary_embedding(pos, q2, k2, cache, False)
+    _assert_half(q1, q2, dtype)
+    _assert_half(k1, k2, dtype)
+
+    lens = [6, 1, 13]
+    n = sum(lens)
+    qq, kk, vv = (torch.randn(n, 4, dd, device="cuda").to(dtype) for dd in (24, 24, 16))
+    cu = torch.tensor([0, 6, 7, 20], device="cuda")
+    _assert_half(
+        C.mla_prefill_attention(qq, kk, vv, cu, 0.2),
+        ref_ops.mla_prefill_attention(qq.float(), kk.float(), vv.float(), cu, 0.2),
+        dtype,
+    )
+
+    R, P = 20, 6
+    kv, tables, sl = _random_paged_cache([1, 9, 17], 4, R + P, torch.float32, "cuda")
+    qd = (torch.randn(3, 4, R + P, device="cuda") * 0.3).to(dtype)
+    _assert_half(
+        C.mla_decode_attention(qd, kv.to(dtype), tables, sl, R, 0.5),
+        ref_ops.mla_decode_attention(qd.float(), kv.to(dtype).float(), tables, sl, R, 0.5),
+        dtype,
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_cuda_half_moe(dtype):
+    need_kernel("moe_combine", "cuda")
+    N, E, k, D, I = 21, 8, 3, 32, 12
+    x = torch.randn(N, D, device="cuda").to(dtype)
+    w_gu = (torch.randn(E, 2 * I, D, device="cuda") * 0.2).to(dtype)
+    w_d = (torch.randn(E, D, I, device="cuda") * 0.2).to(dtype)
+    weights, ids = C.topk_softmax(torch.randn(N, E, device="cuda").to(dtype), k, False)
+    sorted_idx, offsets = C.moe_align(ids, E)
+    hs = x.index_select(0, sorted_idx // k)
+    eo = C.moe_expert_forward(hs, offsets, w_gu, w_d)
+    _assert_half(eo, ref_ops.moe_expert_forward(hs.float(), offsets, w_gu.float(), w_d.float()), dtype)
+    _assert_half(C.moe_combine(eo, sorted_idx, weights, N), ref_ops.moe_combine(eo.float(), sorted_idx, weights, N), dtype)

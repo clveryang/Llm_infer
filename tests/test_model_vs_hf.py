@@ -13,6 +13,7 @@ from llm_infer.engine import Engine, Sequence
 from llm_infer.model import DeepseekV2ForCausalLM
 
 BACKENDS = ["cpp", "torch"] if ops.HAS_CPP else ["torch"]
+DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 def tiny_hf_model(q_lora_rank):
@@ -64,13 +65,14 @@ def hf_logits(hf, ids):
     return hf(torch.tensor([ids])).logits[0].float()
 
 
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("q_lora_rank", [None, 24])
-def test_prefill_and_decode_match_hf(backend, q_lora_rank):
+def test_prefill_and_decode_match_hf(backend, q_lora_rank, device):
     ops.set_backend(backend)
     try:
-        hf = tiny_hf_model(q_lora_rank)
-        ours = ours_from_hf(hf)
+        hf = tiny_hf_model(q_lora_rank)  # 参考模型始终在 CPU 上
+        ours = ours_from_hf(hf).to(device)
         engine = Engine(ours, num_blocks=64, block_size=4)
 
         g = torch.Generator().manual_seed(1)
@@ -78,7 +80,7 @@ def test_prefill_and_decode_match_hf(backend, q_lora_rank):
         seqs = [Sequence(list(p), len(p)) for p in prompts]
 
         # prefill：所有位置的 logits 都要对上
-        got = engine.prefill(seqs, all_logits=True)
+        got = engine.prefill(seqs, all_logits=True).cpu()
         start = 0
         for p in prompts:
             torch.testing.assert_close(got[start : start + len(p)], hf_logits(hf, p), rtol=1e-4, atol=1e-4)
@@ -88,7 +90,7 @@ def test_prefill_and_decode_match_hf(backend, q_lora_rank):
         for _ in range(6):
             for s in seqs:
                 s.token_ids.append(int(torch.randint(0, 97, (1,), generator=g)))
-            got = engine.decode(seqs)
+            got = engine.decode(seqs).cpu()
             for i, s in enumerate(seqs):
                 torch.testing.assert_close(got[i], hf_logits(hf, s.token_ids)[-1], rtol=1e-4, atol=1e-4)
     finally:
