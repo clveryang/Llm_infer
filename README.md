@@ -6,6 +6,11 @@
 - 每个 C++ 算子都有一份纯 PyTorch 参考实现（`llm_infer/ref_ops.py`），用于单测对照和缺内核时回退。
 - 整个模型和 transformers 原生 `DeepseekV2ForCausalLM` 逐 logits 对齐（prefill、分页 decode、贪心生成）。
 
+## 文档
+
+- [模型结构详解](docs/model-structure.md) — 从 embedding 到 logits 逐个部件讲清楚，适合先通读一遍
+- 下面是速览和实现细节
+
 ## DeepSeek-V2-Lite 结构速览
 
 ### 官方架构图
