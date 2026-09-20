@@ -6,6 +6,39 @@
 - 每个 C++ 算子都有一份纯 PyTorch 参考实现（`llm_infer/ref_ops.py`），用于单测对照和缺内核时回退。
 - 整个模型和 transformers 原生 `DeepseekV2ForCausalLM` 逐 logits 对齐（prefill、分页 decode、贪心生成）。
 
+## GPU 上的验证清单
+
+租到机器后按这个顺序走，前 6 步不需要下载模型权重，几分钟就能确认 CUDA 内核是对的。
+
+```bash
+# 仓库是公开的话用 HTTPS（服务器上没有你的 SSH key）
+git clone https://github.com/clveryang/Llm_infer.git && cd Llm_infer
+
+SKIP_MODEL=1 bash scripts/setup_vast.sh     # 检查环境 → 编译 → 测试 → 跑分，不下 32GB 权重
+bash scripts/setup_vast.sh                  # 确认没问题后再下载模型做真实权重对比
+```
+
+脚本分 7 步，任何一步失败都会立刻停下并说明原因：
+
+| 步骤 | 做什么 | 失败常见原因 |
+|---|---|---|
+| 1 | 查 GPU、驱动、nvcc | 用了 runtime 镜像（没有 nvcc），需要换 devel 镜像 |
+| 2 | 查 torch 是否支持这张卡的架构 | Blackwell 需要 sm_120，脚本会自动装 cu128 版 |
+| 3 | 装依赖 | — |
+| 4 | 编译并确认 11 个 CUDA 内核都注册上了 | 显存/内存不够时调小 `MAX_JOBS` |
+| 5 | 单元测试：算子对拍 + 小模型对比 transformers | 内核有 bug，看具体哪个算子 |
+| 6 | 性能对比：自写内核 vs PyTorch | — |
+| 7 | 下载权重，和 transformers 比 logits 和贪心生成 | 磁盘不足（要 ≥150GB） |
+
+单独跑其中某一项：
+
+```bash
+pytest -q tests/test_ops.py -k cuda            # 只测 CUDA 算子
+python scripts/bench.py                        # 算子性能
+python scripts/bench.py --model-dir <dir> --e2e   # 端到端吞吐（两种后端对比）
+python scripts/compare_hf.py --model-dir <dir>    # 真实权重对比 transformers
+```
+
 ## 文档
 
 - [模型结构详解](docs/model-structure.md) — 从 embedding 到 logits 逐个部件讲清楚，适合先通读一遍
@@ -238,10 +271,13 @@ pytest -q tests                            # 29 个测试
 镜像选 `pytorch/pytorch:*-cuda12.8-cudnn9-devel` 或更新的 devel 版，磁盘 ≥150GB。
 
 ```bash
-git clone git@github.com:clveryang/Llm_infer.git && cd Llm_infer
-bash scripts/setup_vast.sh
+git clone https://github.com/clveryang/Llm_infer.git && cd Llm_infer
+SKIP_MODEL=1 bash scripts/setup_vast.sh     # 先验证内核（不下载权重）
+bash scripts/setup_vast.sh                  # 再跑完整流程
 python examples/generate.py --model-dir checkpoints/DeepSeek-V2-Lite-Chat --prompt "介绍一下 MLA"
 ```
+
+详见上面的 [GPU 上的验证清单](#gpu-上的验证清单)。
 
 Blackwell 注意：torch 需要支持 `sm_120`（CUDA ≥ 12.8、驱动 ≥ 570），编译扩展时设置 `TORCH_CUDA_ARCH_LIST=12.0`。
 
