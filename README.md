@@ -91,7 +91,9 @@ flowchart LR
 
 ### MLA（一层注意力）
 
-图中**加粗**的是本项目的 C++ 算子。
+图中**加粗**的是本项目的 C++ 算子。权重形状和「为什么这么设计」见
+[模型结构详解 · MLA](docs/model-structure.md#五mla注意力)，
+或直接跑 `python scripts/mla_shapes.py` 把每一步的形状打出来。
 
 **① 投影、RoPE、写 cache**：prefill 和 decode 都一样
 
